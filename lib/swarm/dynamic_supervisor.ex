@@ -633,7 +633,7 @@ defmodule Swarm.DynamicSupervisor do
     end
   end
 
-  defp start_child(m, f, a) do
+  def sc(m, f, a) do
     try do
       apply(m, f, a)
     catch
@@ -645,6 +645,19 @@ defmodule Swarm.DynamicSupervisor do
       :ignore -> :ignore
       {:error, _} = error -> error
       other -> {:error, other}
+    end
+  end
+
+  defp start_child(m, f, a) do
+    name = List.first(a)
+    case Swarm.register_name(name, __MODULE__, :sc, [m, f, a]) do
+      {:ok, pid} ->
+        Process.link(pid)
+        {:ok, pid}
+      {:ok, pid, extra} ->
+        Process.link(pid)
+        {:ok, pid, extra}
+      other -> other
     end
   end
 
