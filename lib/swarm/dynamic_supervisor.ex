@@ -652,10 +652,12 @@ defmodule Swarm.DynamicSupervisor do
     name = List.first(a)
     case Swarm.register_name(name, __MODULE__, :sc, [m, f, a]) do
       {:ok, pid} ->
-        Process.link(pid)
+        Process.monitor(pid)
+        Process.unlink(pid)
         {:ok, pid}
       {:ok, pid, extra} ->
-        Process.link(pid)
+        Process.monitor(pid)
+        Process.unlink(pid)
         {:ok, pid, extra}
       other -> other
     end
