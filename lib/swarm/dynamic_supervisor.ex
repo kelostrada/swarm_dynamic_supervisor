@@ -291,6 +291,10 @@ defmodule Swarm.DynamicSupervisor do
     validate_and_start_child(supervisor, Supervisor.child_spec(child_spec, []))
   end
 
+  def start_named_child(supervisor, child_spec) do
+    register_name(supervisor, child_spec)
+  end
+
   defp validate_and_start_child(supervisor, child_spec) do
     case validate_child(child_spec) do
       {:ok, child} -> call(supervisor, {:start_child, child})
@@ -633,7 +637,7 @@ defmodule Swarm.DynamicSupervisor do
     end
   end
 
-  def sc(m, f, a) do
+  defp start_child(m, f, a) do
     try do
       apply(m, f, a)
     catch
@@ -645,21 +649,6 @@ defmodule Swarm.DynamicSupervisor do
       :ignore -> :ignore
       {:error, _} = error -> error
       other -> {:error, other}
-    end
-  end
-
-  defp start_child(m, f, a) do
-    name = List.first(a)
-    case Swarm.register_name(name, __MODULE__, :sc, [m, f, a]) do
-      {:ok, pid} ->
-        Process.monitor(pid)
-        Process.unlink(pid)
-        {:ok, pid}
-      {:ok, pid, extra} ->
-        Process.monitor(pid)
-        Process.unlink(pid)
-        {:ok, pid, extra}
-      other -> other
     end
   end
 
@@ -860,9 +849,10 @@ defmodule Swarm.DynamicSupervisor do
     end
   end
 
-  defp maybe_restart_child(:permanent, reason, pid, child, state) do
+  defp maybe_restart_child(:permanent, reason, pid, child, %{name: supervisor} = state) do
     report_error(:child_terminated, reason, pid, child, state)
-    restart_child(pid, child, state)
+    register_name(supervisor, child)
+    {:ok, delete_child(pid, state)}
   end
 
   defp maybe_restart_child(_, :normal, pid, _child, state) do
@@ -877,9 +867,10 @@ defmodule Swarm.DynamicSupervisor do
     {:ok, delete_child(pid, state)}
   end
 
-  defp maybe_restart_child(:transient, reason, pid, child, state) do
+  defp maybe_restart_child(:transient, reason, pid, child, %{name: supervisor} = state) do
     report_error(:child_terminated, reason, pid, child, state)
-    restart_child(pid, child, state)
+    register_name(supervisor, child)
+    {:ok, delete_child(pid, state)}
   end
 
   defp maybe_restart_child(:temporary, reason, pid, child, state) do
@@ -971,6 +962,15 @@ defmodule Swarm.DynamicSupervisor do
       shutdown: shutdown,
       child_type: type
     ]
+  end
+
+  defp register_name(supervisor, %{start: {_, _, args}} = child_spec) do
+    name = List.first(args)
+    Swarm.register_name(name, __MODULE__, :start_child, [supervisor, child_spec])
+  end
+  defp register_name(supervisor, {{id, _, args} = mfa, restart, shutdown, type, modules}) do
+    name = List.first(args)
+    spawn fn -> Swarm.register_name(name, __MODULE__, :start_child, [supervisor, {id, mfa, restart, shutdown, type, modules}]) end
   end
 
   @impl true
