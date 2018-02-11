@@ -86,6 +86,11 @@ defmodule MyApp.Worker do
   def handle_call({:swarm, :begin_handoff}, _from, {name, delay}) do
     {:reply, {:resume, delay}, {name, delay}}
   end
+
+  # crash process for testing
+  def handle_call(:crash, _from, _state) do
+    raise :crash
+  end
   # called after the process has been restarted on its new node,
   # and the old process' state is being handed off. This is only
   # sent if the return to `begin_handoff` was `{:resume, state}`.
@@ -125,6 +130,10 @@ defmodule MyApp.ExampleUsage do
   """
   def start_worker(name) do
     {:ok, pid} = MyApp.Supervisor.start_child(name)
+  end
+
+  def crash(name) do
+    Swarm.call({:via, :swarm, name}, :crash)
   end
 
   ...snip...
