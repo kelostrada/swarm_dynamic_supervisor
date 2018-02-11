@@ -285,24 +285,26 @@ defmodule Swarm.DynamicSupervisor do
           Supervisor.on_start_child()
   def start_child(supervisor, {_, _, _, _, _, _} = child_spec) do
     validate_and_start_child(supervisor, child_spec)
+    |> Task.await
   end
 
   def start_child(supervisor, child_spec) do
     validate_and_start_child(supervisor, Supervisor.child_spec(child_spec, []))
+    |> Task.await
   end
 
-  def start_named_child(supervisor, child_spec) do
-    register_name(supervisor, child_spec)
+  defp register_name(supervisor, {id, _, _, _, _, _} = child) do
+    Task.async(fn -> Swarm.register_name(id, GenServer, :call, [supervisor, {:start_child, child}, :infinity]) end)
   end
 
   defp validate_and_start_child(supervisor, child_spec) do
     case validate_child(child_spec) do
-      {:ok, child} -> call(supervisor, {:start_child, child})
-      error -> {:error, error}
+      {:ok, child} -> register_name(supervisor, child)
+      error -> Task.async(fn -> {:error, error} end)
     end
   end
 
-  defp validate_child(%{id: _, start: {mod, _, _} = start} = child) do
+  defp validate_child(%{id: id, start: {mod, _, _} = start} = child) do
     restart = Map.get(child, :restart, :permanent)
     type = Map.get(child, :type, :worker)
     modules = Map.get(child, :modules, [mod])
@@ -313,24 +315,33 @@ defmodule Swarm.DynamicSupervisor do
         :supervisor -> Map.get(child, :shutdown, :infinity)
       end
 
-    validate_child(start, restart, shutdown, type, modules)
+    validate_child(id, start, restart, shutdown, type, modules)
   end
 
-  defp validate_child({_, start, restart, shutdown, type, modules}) do
-    validate_child(start, restart, shutdown, type, modules)
+  defp validate_child({id, start, restart, shutdown, type, modules}) do
+    validate_child(id, start, restart, shutdown, type, modules)
   end
 
   defp validate_child(other) do
     {:invalid_child_spec, other}
   end
 
-  defp validate_child(start, restart, shutdown, type, modules) do
-    with :ok <- validate_start(start),
+  defp validate_child(id, start, restart, shutdown, type, modules) do
+    with :ok <- validate_id(id),
+         :ok <- validate_start(start),
          :ok <- validate_restart(restart),
          :ok <- validate_shutdown(shutdown),
          :ok <- validate_type(type),
          :ok <- validate_modules(modules) do
-      {:ok, {start, restart, shutdown, type, modules}}
+      {:ok, {id, start, restart, shutdown, type, modules}}
+    end
+  end
+
+  defp validate_id(id) do
+    case Swarm.whereis_name(id) do
+      nil -> :ok
+      :undefined -> :ok
+      pid -> {:already_started, pid}
     end
   end
 
@@ -559,11 +570,11 @@ defmodule Swarm.DynamicSupervisor do
     reply =
       for {pid, args} <- children do
         case args do
-          {:restarting, {_, _, _, type, modules}} ->
-            {:undefined, :restarting, type, modules}
+          {:restarting, {id, _, _, _, type, modules}} ->
+            {id, :restarting, type, modules}
 
-          {_, _, _, type, modules} ->
-            {:undefined, pid, type, modules}
+          {id, _, _, _, type, modules} ->
+            {id, pid, type, modules}
         end
       end
 
@@ -576,16 +587,16 @@ defmodule Swarm.DynamicSupervisor do
 
     {active, workers, supervisors} =
       Enum.reduce(children, {0, 0, 0}, fn
-        {_pid, {:restarting, {_, _, _, :worker, _}}}, {active, worker, supervisor} ->
+        {_pid, {:restarting, {_, _, _, _, :worker, _}}}, {active, worker, supervisor} ->
           {active, worker + 1, supervisor}
 
-        {_pid, {:restarting, {_, _, _, :supervisor, _}}}, {active, worker, supervisor} ->
+        {_pid, {:restarting, {_, _, _, _, :supervisor, _}}}, {active, worker, supervisor} ->
           {active, worker, supervisor + 1}
 
-        {_pid, {_, _, _, :worker, _}}, {active, worker, supervisor} ->
+        {_pid, {_, _, _, _, :worker, _}}, {active, worker, supervisor} ->
           {active + 1, worker + 1, supervisor}
 
-        {_pid, {_, _, _, :supervisor, _}}, {active, worker, supervisor} ->
+        {_pid, {_, _, _, _, :supervisor, _}}, {active, worker, supervisor} ->
           {active + 1, worker, supervisor + 1}
       end)
 
@@ -604,14 +615,6 @@ defmodule Swarm.DynamicSupervisor do
     end
   end
 
-  def handle_call({:start_task, args, restart, shutdown}, from, state) do
-    {init_restart, init_shutdown} = Process.get(Task.Supervisor)
-    restart = restart || init_restart
-    shutdown = shutdown || init_shutdown
-    child = {{Task.Supervised, :start_link, args}, restart, shutdown, :worker, [Task.Supervised]}
-    handle_call({:start_child, child}, from, state)
-  end
-
   def handle_call({:start_child, child}, _from, state) do
     %{dynamic: dynamic, max_children: max_children} = state
 
@@ -622,22 +625,22 @@ defmodule Swarm.DynamicSupervisor do
     end
   end
 
-  defp handle_start_child({{m, f, args} = mfa, restart, shutdown, type, modules}, state) do
+  defp handle_start_child({id, {m, f, args} = mfa, restart, shutdown, type, modules}, state) do
     %{extra_arguments: extra} = state
 
-    case reply = start_child(m, f, extra ++ args) do
+    case reply = do_start_child(m, f, extra ++ args) do
       {:ok, pid, _} ->
-        {:reply, reply, save_child(pid, mfa, restart, shutdown, type, modules, state)}
+        {:reply, reply, save_child(pid, id, mfa, restart, shutdown, type, modules, state)}
 
       {:ok, pid} ->
-        {:reply, reply, save_child(pid, mfa, restart, shutdown, type, modules, state)}
+        {:reply, reply, save_child(pid, id, mfa, restart, shutdown, type, modules, state)}
 
       _ ->
         {:reply, reply, update_in(state.dynamic, &(&1 - 1))}
     end
   end
 
-  defp start_child(m, f, a) do
+  defp do_start_child(m, f, a) do
     try do
       apply(m, f, a)
     catch
@@ -652,12 +655,12 @@ defmodule Swarm.DynamicSupervisor do
     end
   end
 
-  defp save_child(pid, {m, f, _}, :temporary, shutdown, type, modules, state) do
-    put_in(state.children[pid], {{m, f, :undefined}, :temporary, shutdown, type, modules})
+  defp save_child(pid, id, {m, f, _}, :temporary, shutdown, type, modules, state) do
+    put_in(state.children[pid], {id, {m, f, :undefined}, :temporary, shutdown, type, modules})
   end
 
-  defp save_child(pid, mfa, restart, shutdown, type, modules, state) do
-    put_in(state.children[pid], {mfa, restart, shutdown, type, modules})
+  defp save_child(pid, id, mfa, restart, shutdown, type, modules, state) do
+    put_in(state.children[pid], {id, mfa, restart, shutdown, type, modules})
   end
 
   defp exit_reason(:exit, reason, _), do: reason
@@ -694,6 +697,14 @@ defmodule Swarm.DynamicSupervisor do
       %{} ->
         {:noreply, state}
     end
+  end
+
+  # Ignore Task monitors
+  def handle_info({_ref, _result}, state) do
+    {:noreply, state}
+  end
+  def handle_info({:DOWN, _ref, :process, pid, :normal}, state) when is_pid(pid) do
+    {:noreply, state}
   end
 
   def handle_info(msg, state) do
@@ -746,7 +757,7 @@ defmodule Swarm.DynamicSupervisor do
       {_, {:restarting, _}}, acc ->
         acc
 
-      {pid, {_, restart, _, _, _} = child}, {pids, times, stacks} ->
+      {pid, {_, _, restart, _, _, _} = child}, {pids, times, stacks} ->
         case monitor_child(pid) do
           :ok ->
             times = exit_child(pid, child, times)
@@ -775,7 +786,7 @@ defmodule Swarm.DynamicSupervisor do
     end
   end
 
-  defp exit_child(pid, {_, _, shutdown, _, _}, times) do
+  defp exit_child(pid, {_, _, _, shutdown, _, _}, times) do
     case shutdown do
       :brutal_kill ->
         Process.exit(pid, :kill)
@@ -823,14 +834,14 @@ defmodule Swarm.DynamicSupervisor do
     end
   end
 
-  defp wait_child(pid, {_, _, :brutal_kill, _, _} = child, reason, stacks) do
+  defp wait_child(pid, {_, _, _, :brutal_kill, _, _} = child, reason, stacks) do
     case reason do
       :killed -> stacks
       _ -> Map.put(stacks, pid, {child, reason})
     end
   end
 
-  defp wait_child(pid, {_, restart, _, _, _} = child, reason, stacks) do
+  defp wait_child(pid, {_, _, restart, _, _, _} = child, reason, stacks) do
     case reason do
       {:shutdown, _} -> stacks
       :shutdown -> stacks
@@ -841,7 +852,7 @@ defmodule Swarm.DynamicSupervisor do
 
   defp maybe_restart_child(pid, reason, %{children: children} = state) do
     case children do
-      %{^pid => {_, restart, _, _, _} = child} ->
+      %{^pid => {_, _, restart, _, _, _} = child} ->
         maybe_restart_child(restart, reason, pid, child, state)
 
       %{} ->
@@ -922,16 +933,16 @@ defmodule Swarm.DynamicSupervisor do
   end
 
   defp restart_child(:one_for_one, current_pid, child, state) do
-    {{m, f, args} = mfa, restart, shutdown, type, modules} = child
+    {id, {m, f, args} = mfa, restart, shutdown, type, modules} = child
 
-    case start_child(m, f, args) do
+    case do_start_child(m, f, args) do
       {:ok, pid, _} ->
         state = delete_child(current_pid, state)
-        {:ok, save_child(pid, mfa, restart, shutdown, type, modules, state)}
+        {:ok, save_child(pid, id, mfa, restart, shutdown, type, modules, state)}
 
       {:ok, pid} ->
         state = delete_child(current_pid, state)
-        {:ok, save_child(pid, mfa, restart, shutdown, type, modules, state)}
+        {:ok, save_child(pid, id, mfa, restart, shutdown, type, modules, state)}
 
       :ignore ->
         {:ok, delete_child(current_pid, state)}
@@ -953,24 +964,15 @@ defmodule Swarm.DynamicSupervisor do
     )
   end
 
-  defp extract_child(pid, {mfa, restart, shutdown, type, _modules}) do
+  defp extract_child(pid, {id, mfa, restart, shutdown, type, _modules}) do
     [
       pid: pid,
-      id: :undefined,
+      id: id,
       mfargs: mfa,
       restart_type: restart,
       shutdown: shutdown,
       child_type: type
     ]
-  end
-
-  defp register_name(supervisor, %{start: {_, _, args}} = child_spec) do
-    name = List.first(args)
-    Swarm.register_name(name, __MODULE__, :start_child, [supervisor, child_spec])
-  end
-  defp register_name(supervisor, {{id, _, args} = mfa, restart, shutdown, type, modules}) do
-    name = List.first(args)
-    spawn fn -> Swarm.register_name(name, __MODULE__, :start_child, [supervisor, {id, mfa, restart, shutdown, type, modules}]) end
   end
 
   @impl true
