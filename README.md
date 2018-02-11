@@ -30,6 +30,8 @@ node failures and will be restarted and registered by the same name on unhandled
 process crashes (like with regular `DynamicSupervisor`). After restart it's not
 determined that the process will restarted on the same node.
 
+You can check it in action in [example project](https://github.com/kelostrada/swarm_dynamicsupervisor_test).
+
 ```elixir
 defmodule MyApp.Supervisor do
   @moduledoc """
@@ -133,7 +135,7 @@ defmodule MyApp.ExampleUsage do
   end
 
   def crash(name) do
-    Swarm.call({:via, :swarm, name}, :crash)
+    GenServer.call({:via, :swarm, name}, :crash)
   end
 
   ...snip...
