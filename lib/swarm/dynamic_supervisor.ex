@@ -293,13 +293,34 @@ defmodule Swarm.DynamicSupervisor do
     |> Task.await
   end
 
+  def start_child(supervisor, {_, _, _, _, _, _} = child_spec, {_m, _f, _a} = start_fun) do
+    validate_and_start_child(supervisor, child_spec, start_fun)
+    |> Task.await
+  end
+
+  def start_child(supervisor, child_spec, {_m, _f, _a} = start_fun) do
+    validate_and_start_child(supervisor, Supervisor.child_spec(child_spec, []), start_fun)
+    |> Task.await
+  end
+
   defp register_name(supervisor, {id, _, _, _, _, _} = child) do
     Task.async(fn -> Swarm.register_name(id, GenServer, :call, [supervisor, {:start_child, child}, :infinity]) end)
+  end
+
+  defp register_name(supervisor, {id, _, _, _, _, _} = child, {m, f, a}) do
+    Task.async(fn -> Swarm.register_name(id, m, f, [supervisor, child | a]) end)
   end
 
   defp validate_and_start_child(supervisor, child_spec) do
     case validate_child(child_spec) do
       {:ok, child} -> register_name(supervisor, child)
+      error -> Task.async(fn -> {:error, error} end)
+    end
+  end
+
+  defp validate_and_start_child(supervisor, child_spec, mfa) do
+    case validate_child(child_spec) do
+      {:ok, child} -> register_name(supervisor, child, mfa)
       error -> Task.async(fn -> {:error, error} end)
     end
   end
